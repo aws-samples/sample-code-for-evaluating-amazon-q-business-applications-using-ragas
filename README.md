@@ -1,93 +1,175 @@
-# amazonq_evaluation_lambda
+# AmazonQEvaluationLambda
+
+**Sample Code for Q Business Application Response Evaluation using RAGAS**
 
 
+[Amazon Q Business](https://aws.amazon.com/q/business/) is a generative AI-powered application that helps users get work done. 
+Amazon Q Business can become your tailored business expert and let you discover content, brainstorm ideas, or gain further insight using your company’s data safely and securely. 
+For more information see: [Introducing Amazon Q, a new generative AI-powered assistant (preview)](https://aws.amazon.com/blogs/aws/introducing-amazon-q-a-new-generative-ai-powered-assistant-preview)
 
-## Getting started
+In this project we share a solution that lets you evaluate your Q Business application responses using RAGAS against a test-set of questions and ground-truth.
+The sample code solution provided in this repo allows the user to:
+- evaluate the Q Business application responses against a test-set of questions & ground truths
+- Visualize the metrics in Cloudwatch
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+Based on the input test-set and the responses from the Q Busieness application, RAGAS evaluates 4 different metrics:
+- Answer Relevancy
+- Faithfulness
+- Context Recall
+- Context Precision
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+For more information about the RAGAS evaluation metrics see: [RAGAS Metrics](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/)
 
-## Add your files
+## How to deploy the solution
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+### Prerequisites
+
+1. You need to have an AWS account and an IAM Role/User with permissions to create and manage the necessary resources and components for this application.*(If you do not have an AWS account, please see [How do I create and activate a new Amazon Web Services account?](https://aws.amazon.com/premiumsupport/knowledge-center/create-and-activate-aws-account/))*
+2. You also need to have an existing, working Amazon Q business application integrated with IdC or Cognito as an IdP. If you haven't set one up yet, see [Creating an Amazon Q application](https://docs.aws.amazon.com/amazonq/latest/business-use-dg/create-app.html)
+3. You have the latest version of aws cli  installed on your system. If you haven't installed yet, see [Installing the AWS CLI version 2](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html)
+4. You have `sam` installed on your system, see [Install SAM](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
+5. You have `Docker` installed on your system, see [Install Docker](https://docs.docker.com/engine/install/)
+
+
+### Setup
+
+#### 1. Create the Cognito Authentication Infrastructure 
+
+##### 1.1 Create the Cognito Authentication Infrastructure
+**If you already have a Q Business application that uses Cognito as IdP, you can skip this step**
+    
+The QEval lambda solution uses AWS Congito as an OIDC provider, in this step a cloudformation stack is deploy to create all the required resources needed.
+To deploy the Cognito infrastructure run `aws configure` to configure your aws credentials,
+then run the following command:
+```
+aws cloudformation deploy --template-file authentication_infra_template.yml --stack-name QEvalAuthInfra \
+--parameter-overrides CreateOIDCProvider=false \
+--capabilities CAPABILITY_NAMED_IAM --region=THE_REGION_OF_YOUR_Q_BUSINESS_APPLICATION
+```
+
+Please note that only a single instance of OIDCProvider for Cognito using `"https://cognito-identity.amazonaws.com"` can be created for an account globally
+if you already have one deploy you just need to add the identity pool Id to the `audience list`
+
+##### 1.2 Create a user in your Cognito UserPool
+
+run this to create a Cognito user
+
+`aws cognito-idp admin-create-user \ --user-pool-id $UserPoolId \ --username $UserEmail`
+
+Reset the user password
+
+`aws cognito-idp admin-set-user-password --user-pool-id $UserPoolId --username $UserEmail --password $SOME_PASSWORD --permanent`
+
+Verify the user email
+```
+aws cognito-idp admin-update-user-attributes \
+--user-pool-id $UserPoolId \
+--username $UserEmail \
+--user-attributes Name=email_verified,Value=true
+```
+
+Create a secret in AWS Secret Manager
+```
+aws secretsmanager create-secret --name qevalsecret \
+ --secret-string '{"password": "$SOME_PASSWORD" }'
+```
+
+
+Create an IAM Role with Permissions to your Q Business application
+
+Role Policy
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.aws.dev/nsalamaa/amazonq_evaluation_lambda.git
-git branch -M main
-git push -uf origin main
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "QBusinessAdmin",
+            "Effect": "Allow",
+            "Action": [
+                "qbusiness:*",
+                "qapps:*",
+                "user-subscriptions:*",
+                "kms:*"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "QBusinessKMSDecryptPermissions",
+            "Effect": "Allow",
+            "Action": [
+                "kms:Decrypt"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
 ```
 
-## Integrate with your tools
+Trust Policy
+```
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "arn:aws:iam::YOUR_ACCOUNT_ID:oidc-provider/cognito-identity.amazonaws.com"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "cognito-identity.amazonaws.com:aud": "YOUR_OIDCCLIENTID"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "arn:aws:iam::YOUR_ACCOUNT_ID:oidc-provider/cognito-identity.amazonaws.com"
+            },
+            "Action": "sts:TagSession",
+            "Condition": {
+                "StringLike": {
+                    "aws:RequestTag/Email": "*"
+                }
+            }
+        }
+    ]
+}
+```
 
-- [ ] [Set up project integrations](https://gitlab.aws.dev/nsalamaa/amazonq_evaluation_lambda/-/settings/integrations)
+Copy the Arn of your IAM role, you will need it in step 3
 
-## Collaborate with your team
+#### 2. Enable Bedrock models in Your Region
+RAGAS uses LLM models to process the input testset and responses in the evaluation.
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+To run the evaluation we need 2 LLM models:
+- 1 Embedding model such as `amazon.titan-embed-text-v1`
+- 1 Text model such as `anthropic.claude-v2`
 
-## Test and Deploy
+Steps:
+- Go to Amazon Bedrock in console.
+- Go to `Base Models`.
+- request access to your models of choice.
+- Copy the `Model ID` for each one, you'll need them in the next step.
 
-Use the built-in continuous integration in GitLab.
+#### 3. Deploy the QEvaluation Lambda
+ - Build your code using `sam build`
+ - deploy your resources using `sam deploy --guided`
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+While deploying the stack you will need to provide the following parameters:
+- `Stack Name`: the stack name for the Q Evaluation lambda
+- `AWS Region`: the AWS region where you want to deploy your solution
+- `QBusinessApplicationId`: the ID of your Q Application
+- `BedrockEmbeddingModelId`: The embedding model ID that you copied in step 2
+- `BedrockTextModelId`: The text model ID that you copied in step 2
+- `UserPoolId`: Your Cognito UserPool Id that was deployed in step 1
+- `ClientId`: Your Cognito Client Id
+- `UserEmail`: The cognito user email that you created in step 1.2
+- `UserSecretId`: The user secret Id that you created in step 1.2
+- `IdentityPoolId`: The Cognito Identity Pool Id
+- `QAppRoleArn`: The IAM role arn that you created in step 1.2
 
-***
 
-# Editing this README
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
