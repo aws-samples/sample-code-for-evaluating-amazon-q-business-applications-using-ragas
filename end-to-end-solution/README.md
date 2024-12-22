@@ -28,7 +28,7 @@ Steps:
 #### 2. Clone this repo into your laptop and go to ./end-to-end-solution
 
 #### 3. Run deploy script providing cloudformation stack name and aws region where to deploy the stack
-  - ./deploy -s < Cfn Stack Name > -r < AWS REGION >
+  - ./deploy -s `Cfn Stack Name` -r `AWS REGION`
   - This script deploys all solution into your account using Cloudformation. Once the deployment is finish, you get the message 'Deployment completed successfully!'
 
 #### 4. Open AWS Console and go to the Amazon Q Business console.

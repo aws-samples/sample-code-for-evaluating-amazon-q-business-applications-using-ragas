@@ -8,11 +8,11 @@ In this project we share two solutions that lets you evaluate your Q Business ap
 
 **Sample Code for Amazon Q Business Application Response Evaluation using RAGAS**
 
-[AmazonQEvaluationLambda](AmazonQEvaluationLambda/README.md)
+[AmazonQEvaluationLambda](AmazonQEvaluationLambda/)
 
 **Evaluation Framework for Amazon Q Business Applications**
 
-[Evaluating Amazon Q Business applications](end-to-end-solution/README.md)
+[Evaluating Amazon Q Business applications](end-to-end-solution/)
 
 ## Security
 
