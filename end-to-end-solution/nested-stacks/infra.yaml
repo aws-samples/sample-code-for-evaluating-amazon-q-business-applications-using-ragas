@@ -1,0 +1,969 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Nested stack for Streamlit app with Cognito auth and Amazon Q Business integration
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'VPCConfig'
+        Parameters:
+        - Vpccidr
+        - PublicSubnetAcidr
+        - PublicSubnetBcidr
+        - PrivateSubnetAcidr
+        - PrivateSubnetBcidr
+        
+Parameters:
+  RagasBucket:
+    Type: String
+    Description: S3 Bucket for RAGAS evaluation
+  
+  AssetsBucket:
+    Description: Assets bucket name
+    Type: String
+
+  AssetsPrefix: 
+    Description: Assets bucket prefix
+    Type: String
+    Default: 'dataset/'
+  
+  BedrockEmbeddingModelId:
+    Type: String
+    Description: Bedrock embedding model for evals
+    Default: "amazon.titan-embed-text-v1"
+    
+  BedrockTextModelId:
+    Type: String
+    Description: Bedrock text model for evals
+    Default: "anthropic.claude-3-sonnet-20240229-v1:0"
+  
+  UserName:
+    Type: String
+    Description: 'Name of the IAM Identity Center user to create'
+    Default: 'qbusiness'
+    MinLength: 4
+    ConstraintDescription: 'must be at least 4 character'
+  
+  Password: 
+    Type: String
+    Description: Password for the new cognition user
+    Default: 'Riv2024!'
+    NoEcho: true
+    
+  UserEmail:
+    Type: String
+    Description: 'Email of the IAM Identity Center user'
+    Default: qbusiness@example.com
+    AllowedPattern: ^[^@]+@[^@]+\.[^@]+$    
+    ConstraintDescription: 'must be a valid email address'
+  
+  Vpccidr:
+    Description: Please enter the IP range (CIDR notation) for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnetAcidr:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 10.0.0.0/24
+
+  PublicSubnetBcidr:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the second Availability Zone
+    Type: String
+    Default: 10.0.1.0/24
+
+  PrivateSubnetAcidr:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the first Availability Zone
+    Type: String
+    Default: 10.0.2.0/24
+
+  PrivateSubnetBcidr:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the second Availability Zone
+    Type: String
+    Default: 10.0.3.0/24
+
+Resources:
+
+  QBusinessServiceLinkedRole:
+    Type: 'AWS::IAM::ServiceLinkedRole'
+    Properties:
+      AWSServiceName: qbusiness.amazonaws.com
+      Description: 'Service-linked role for Amazon Q Business'
+ 
+  #ECR to store RAGAS image for lambda
+  RAGASContainerRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: q_evaluation_lambda
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  #CodeBuild to build docker image
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess
+      Policies:
+        - PolicyName: CodeBuildCustomPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${RagasBucket}'
+                  - !Sub 'arn:aws:s3:::${RagasBucket}/*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt RAGASContainerRepo.Arn
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+  
+  #CodeBuild Project
+  DockerBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-docker-build
+      Description: 'Build Docker image and push to ECR'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RAGASContainerRepo}
+          - Name: IMAGE_TAG
+            Value: latest
+      Source:
+        Type: S3
+        Location: !Sub ${RagasBucket}/
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO_URI
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - docker build -t $ECR_REPO_URI:$IMAGE_TAG .
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker image...
+                - docker push $ECR_REPO_URI:$IMAGE_TAG
+                - echo Writing image definitions file...
+                - printf '{"ImageURI":"%s"}' $ECR_REPO_URI:$IMAGE_TAG > imageDefinitions.json
+  
+  BuildTrigger:
+    Type: Custom::BuildTrigger
+    Properties:
+      ServiceToken: !GetAtt TriggerBuildFunction.Arn
+      BuildProjectName: !Ref DockerBuildProject
+
+  TriggerBuildFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt TriggerBuildFunctionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      codebuild = boto3.client('codebuild')
+                      build = codebuild.start_build(
+                          projectName=event['ResourceProperties']['BuildProjectName']
+                      )
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                          {'BuildId': build['build']['id']})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  TriggerBuildFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeBuildStartBuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt DockerBuildProject.Arn
+
+
+  IAMIdentityCenterInstance:
+    Type: AWS::SSO::Instance
+    Properties:
+      Tags: 
+        - Key: Purpose
+          Value: AmazonQBusiness
+ 
+
+  # Create S3 bucket for data source (Amazon Q Business)
+  # Create VPC, subnets, sg, ALB for Streamlit UI
+
+  S3DataSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub riv2024-qb-data-source-${AWS::AccountId}
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+################
+##### VPC #####
+##############
+
+  streamlitvpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref Vpccidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: 'VPC'
+  
+  VPCLogGroup:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      RetentionInDays: 7
+      
+  VPCLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "LogsPolicy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:PutRetentionPolicy'
+                Resource: '*'
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref streamlitvpc
+      ResourceType: VPC
+      TrafficType: ALL
+      LogGroupName: !Ref VPCLogGroup
+      DeliverLogsPermissionArn: !GetAtt VPCLogRole.Arn
+  
+  ##########################
+  ##### Public Subnet #####
+  ########################
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: InternetGateway
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref streamlitvpc
+
+  # Create a Subnet
+  PublicSubnetA:  
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref PublicSubnetAcidr
+      VpcId: !Ref streamlitvpc
+      AvailabilityZone: !Select 
+                          - 0
+                          - Fn::GetAZs: !Ref 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: PublicSubnetA
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref PublicSubnetBcidr
+      VpcId: !Ref streamlitvpc
+      AvailabilityZone: !Select 
+                          - 1
+                          - Fn::GetAZs: !Ref 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: PublicSubnetB
+  
+  # Public Route Table 
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref streamlitvpc
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+  
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetB
+
+  ##########################
+  ##### Private Subnet #####
+  ########################
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref PrivateSubnetAcidr
+      VpcId: !Ref streamlitvpc
+      AvailabilityZone: !Select 
+                          - 0
+                          - Fn::GetAZs: !Ref 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: PrivateSubnetA
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref PrivateSubnetBcidr
+      VpcId: !Ref streamlitvpc
+      AvailabilityZone: !Select 
+                          - 1
+                          - Fn::GetAZs: !Ref 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: PrivateSubnetB
+
+  # NAT Gateway
+  NatGatewayAEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGatewayBEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayAEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayBEIP.AllocationId
+      SubnetId: !Ref PublicSubnetB
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref streamlitvpc
+      Tags:
+        - Key: Name
+          Value: PrivateRouteTableA
+
+  DefaultPrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      SubnetId: !Ref PrivateSubnetA
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref streamlitvpc
+      Tags:
+        - Key: Name
+          Value: PrivateRouteTableB
+
+  DefaultPrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayB
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      SubnetId: !Ref PrivateSubnetB
+
+        
+  # Create IAM Identity Center User
+  # Create Amazon Q Business Application with support data (S3 Bucket)
+
+
+  # Create IAM Identity Center User
+
+  CreateUserIAMIdentityCenter:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRoleCreateUserIAMId.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          IdentityStoreId: !GetAtt IAMIdentityCenterInstance.IdentityStoreId
+          User_Name: !Ref UserName
+          User_Email: !Ref UserEmail
+          
+      Code:
+        ZipFile: |
+          import boto3
+          from botocore.exceptions import ClientError
+          import cfnresponse
+          import os
+
+          identitystore = boto3.client('identitystore')
+
+          def handler(event, context): 
+            
+            User_Name = os.environ['User_Name']
+            User_Email = os.environ['User_Email']
+            IdentityStoreId = os.environ['IdentityStoreId']
+            
+            try:
+              if event['RequestType'] in ['Create', 'Update']:
+                
+                # Create user
+                response = identitystore.create_user(
+                  IdentityStoreId=IdentityStoreId,
+                  UserName=User_Name,
+                  Name={
+                    'Formatted': User_Name,
+                    'FamilyName': User_Name,
+                    'GivenName': User_Name
+                  },
+                  DisplayName= User_Name,
+                  Emails=[{
+                    'Value': User_Email,
+                    'Type': 'Work',
+                    'Primary': True
+                  }]
+                )
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                  'UserId': response['UserId']
+                })
+
+              elif event['RequestType'] == 'Delete':
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Delete request acknowledged. No action taken.'})
+
+            except Exception as e:
+              print(f"Error during deletion: {str(e)}")
+              cfnresponse.send(event, context, cfnresponse.FAILED, { 'Error': str(e)})
+
+  LambdaExecutionRoleCreateUserIAMId:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CreateUserIAMIdentityCenter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'identitystore:CreateUser'
+                  - 'identitystore:DeleteUser'
+                  - 'iam:CreateServiceLinkedRole'
+                Resource: '*'
+
+  CreateUserIAMIdentityCenterCustomResource:
+    Type: Custom::CreateUserIAMIdentityCenter
+    Properties:
+      ServiceToken: !GetAtt CreateUserIAMIdentityCenter.Arn
+
+
+  QBusinessWebExperienceServiceManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:      
+      Description: Q Web Experience Managed Policy
+      Path: /service-role/
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "QBusinessConversationPermission"
+            Effect: Allow
+            Action: 
+            - "s3:GetObject"
+            - "qbusiness:Chat"
+            - "qbusiness:ChatSync"
+            - "qbusiness:ListMessages"
+            - "qbusiness:ListConversations"
+            - "qbusiness:DeleteConversation"
+            - "qbusiness:PutFeedback"
+            - "qbusiness:GetWebExperience"
+            - "qbusiness:GetApplication"
+            - "qbusiness:ListPlugins"
+            - "qbusiness:GetChatControlsConfiguration"              
+            Resource: !Sub "arn:${AWS::Partition}:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApp.ApplicationId}"
+          - Sid: "QBusinessKMSDecryptPermissions"
+            Effect: Allow
+            Action: "kms:Decrypt"
+            Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/key_id"
+            Condition:
+              StringEquals:
+                "kms:ViaService": !Sub "qbusiness:${AWS::Region}:amazonaws.com"
+          - Sid: "QBusinessQAppsPermissions"
+            Effect: Allow
+            Action: 
+            -  "qapps:CreateQApp"
+            -  "qapps:PredictProblemStatementFromConversation"
+            -  "qapps:PredictQAppFromProblemStatement"
+            -  "qapps:CopyQApp"
+            -  "qapps:GetQApp"
+            -  "qapps:ListQApps"
+            -  "qapps:UpdateQApp"
+            -  "qapps:DeleteQApp"
+            -  "qapps:AssociateQAppWithUser"
+            -  "qapps:DisassociateQAppFromUser"
+            -  "qapps:ImportDocumentToQApp"
+            -  "qapps:ImportDocumentToQAppSession"
+            -  "qapps:CreateLibraryItem"
+            -  "qapps:GetLibraryItem"
+            -  "qapps:UpdateLibraryItem"
+            -  "qapps:CreateLibraryItemReview"
+            -  "qapps:ListLibraryItems"
+            -  "qapps:CreateSubscriptionToken"
+            -  "qapps:StartQAppSession"
+            -  "qapps:StopQAppSession"
+            Resource: !Sub "arn:${AWS::Partition}:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApp.ApplicationId}"
+
+  QBusinessWebExperienceServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service: 
+               - application.qbusiness.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+              - 'sts:SetContext'              
+            Condition:
+              StringEquals: 
+                "aws:SourceAccount": !Sub "${AWS::AccountId}"
+              ArnLike: 
+                "aws:SourceArn": !Sub "arn:${AWS::Partition}:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApp.ApplicationId}"
+      Path: /service-role/
+      ManagedPolicyArns:
+        - !Ref QBusinessWebExperienceServiceManagedPolicy
+    DependsOn:
+      - QBusinessWebExperienceServiceManagedPolicy                      
+
+  QBusinessDataSourceManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:      
+      Description: Q DataSource Managed Policy
+      Path: /service-role/
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowsAmazonQToGetObjectfromS3"
+            Effect: Allow
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${S3DataSourceBucket}/*"
+            Condition:
+              StringEquals:
+                "aws:ResourceAccount": !Sub "${AWS::AccountId}"
+          - Sid: "AllowsAmazonQToListS3Buckets"
+            Effect: Allow
+            Action: "s3:ListBucket"
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${S3DataSourceBucket}"
+            Condition:
+              StringEquals:
+                "aws:ResourceAccount": !Sub "${AWS::AccountId}"
+          - Sid: "AllowsAmazonQToIngestDocuments"
+            Effect: Allow
+            Action: 
+            - "qbusiness:BatchPutDocument"
+            - "qbusiness:BatchDeleteDocument" 
+            Resource:
+            - !Sub "arn:${AWS::Partition}:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApp.ApplicationId}/index/${QBusinessIndex.IndexId}"
+          - Sid: "AllowsAmazonQToCallMappingAPIs"
+            Effect: Allow
+            Action:
+            - "qbusiness:PutGroup"
+            - "qbusiness:CreateUser"
+            - "qbusiness:DeleteGroup"
+            - "qbusiness:UpdateUser"
+            - "qbusiness:ListGroups"
+            Resource:
+            - !Sub "arn:${AWS::Partition}:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApp.ApplicationId}"
+            - !Sub "arn:${AWS::Partition}:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApp.ApplicationId}/index/${QBusinessIndex.IndexId}"
+            - !Sub "arn:${AWS::Partition}:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApp.ApplicationId}/index/${QBusinessIndex.IndexId}/data-source/*"
+
+  QBusinessDataSourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service: 
+               - qbusiness.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+            Condition:
+              StringEquals: 
+                "aws:SourceAccount": !Sub "${AWS::AccountId}"
+              ArnLike: 
+                "aws:SourceArn": !Sub "arn:${AWS::Partition}:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApp.ApplicationId}"
+      Path: /service-role/
+      ManagedPolicyArns:
+        - !Ref QBusinessDataSourceManagedPolicy
+    DependsOn:
+      - QBusinessDataSourceManagedPolicy      
+               
+  QBusinessApp:
+    Type: AWS::QBusiness::Application
+    Properties:
+      DisplayName: 'riv2024-evaluation-qb-app'
+      Description: Q Business Application
+      IdentityCenterInstanceArn: !GetAtt IAMIdentityCenterInstance.InstanceArn
+      RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/qbusiness.amazonaws.com/AWSServiceRoleForQBusiness
+
+  QBusinessIndex:
+    Type: AWS::QBusiness::Index
+    Properties:
+     ApplicationId: !GetAtt  QBusinessApp.ApplicationId
+     DisplayName: qci-insights-index
+
+  QBusinessRetriver:
+    Type: AWS::QBusiness::Retriever
+    Properties:
+     ApplicationId: !GetAtt  QBusinessApp.ApplicationId
+     Configuration:
+      NativeIndexConfiguration:
+        IndexId: !GetAtt QBusinessIndex.IndexId
+     DisplayName: qci-insights-index
+     Type: NATIVE_INDEX
+
+  QBusinessWebExperience:
+    Type: AWS::QBusiness::WebExperience
+    Properties:
+     ApplicationId: !GetAtt  QBusinessApp.ApplicationId
+     RoleArn: !GetAtt QBusinessWebExperienceServiceRole.Arn
+     Title: Q Support Insights 
+  
+  QBusinessDataSource:
+    Type: AWS::QBusiness::DataSource
+    Properties:
+     ApplicationId: !GetAtt QBusinessApp.ApplicationId
+     Configuration:
+        type: "S3"
+        version: "1.0.0"
+        syncMode: "FORCED_FULL_CRAWL"
+        additionalProperties:
+          inclusionPrefixes:
+            - ""
+        connectionConfiguration:
+          repositoryEndpointMetadata:
+            BucketName: !Ref S3DataSourceBucket
+        repositoryConfigurations:
+          document:
+            fieldMappings:
+              - dataSourceFieldName: "s3_document_id"
+                indexFieldName: "s3_document_id"
+                indexFieldType: "STRING"      
+     DisplayName: s3-datasource
+     SyncSchedule: 'cron(0 0 * * ? *)'
+     IndexId: !GetAtt QBusinessIndex.IndexId
+     RoleArn: !GetAtt QBusinessDataSourceRole.Arn
+
+  QBusinessDataSourceSync:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionDataSourceSyncRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+      Environment:
+        Variables:
+          AssetsBucket: !Ref AssetsBucket
+          AssetsPrefix: !Ref AssetsPrefix
+          qDataSourceID: !GetAtt QBusinessDataSource.DataSourceId
+          QBusinessApp: !GetAtt QBusinessApp.ApplicationId
+          qDataSourceIndexId: !GetAtt QBusinessIndex.IndexId
+          S3DataSourceBucket: !Ref S3DataSourceBucket
+          
+      Code:
+        ZipFile: |
+          import boto3
+          from botocore.exceptions import ClientError
+          import cfnresponse
+          import os
+          import time
+
+          qbusiness = boto3.client('qbusiness')
+          s3_client = boto3.client('s3')
+          s3 = boto3.resource('s3')
+
+          def handler(event, context): 
+            
+            QBusinessApp = os.environ['QBusinessApp']
+            AssetsBucket = os.environ['AssetsBucket']
+            AssetsPrefix= os.environ['AssetsPrefix']
+            S3DataSourceBucket = os.environ['S3DataSourceBucket']
+            qDataSourceIndexId = os.environ['qDataSourceIndexId']
+            qDataSourceID = os.environ['qDataSourceID']
+            
+            try:
+              if event['RequestType'] in ['Create', 'Update']:
+
+                print("AssetsBucket ", AssetsBucket)
+                print("S3DataSourceBucket ", S3DataSourceBucket)
+
+                file_name = 'qbusiness-ug.pdf'
+                source_prefix = AssetsPrefix
+                key = f"{source_prefix}{file_name}"
+                                
+                dest = s3.Bucket(S3DataSourceBucket)
+                CopySource = {'Bucket': AssetsBucket, 'Key': key}
+                dest.copy(CopySource, file_name)
+                
+                response = qbusiness.start_data_source_sync_job(
+                  dataSourceId=qDataSourceID,
+                  applicationId=QBusinessApp,
+                  indexId=qDataSourceIndexId,
+                )
+
+                                
+
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                  'Message': 'DONE!'
+                })
+
+              elif event['RequestType'] == 'Delete':
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Delete request acknowledged. No action taken.'})
+
+            except Exception as e:
+              print(f"Error during deletion: {str(e)}")
+              cfnresponse.send(event, context, cfnresponse.FAILED, { 'Error': str(e)})
+    DependsOn: 
+      - QBusinessApp
+      - QBusinessDataSource
+      - QBusinessIndex
+      - S3DataSourceBucket
+
+  LambdaExecutionDataSourceSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QBusinessDataSourceSync
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'qbusiness:*'
+                  - 's3:*'
+                  - 'identitystore:*'
+                  - 'iam:CreateServiceLinkedRole'
+                Resource: '*'
+
+  QBusinessDataSourceSyncCustomResource:
+    Type: Custom::QBusinessDataSourceSync
+    Properties:
+      ServiceToken: !GetAtt QBusinessDataSourceSync.Arn
+  
+Outputs:
+
+  VpcId:
+    Description: "Streamlit app VPC"
+    Value: !Ref streamlitvpc
+    Export:
+      Name: "VpcId"
+    
+  PublicSubnetA:
+    Description: "Streamlit app public subnet A"
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: "PublicSubnetA"
+    
+  PublicSubnetB:
+    Description: "Streamlit app public subnet B"
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: "PublicSubnetB"
+    
+  PrivateSubnetA:
+    Description: "Streamlit app private subnet A"
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: "PrivateSubnetA"
+    
+  PrivateSubnetB:
+    Description: "Streamlit app private subnet B"
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: "PrivateSubnetB"
+    
+  QApplicationId:
+    Description: "Q Business App"
+    Value: !Ref QBusinessApp
+    Export:
+      Name: "QApplicationId"
+    
+  IDCInstanceArn:
+    Description: "IAM Identity Center Instance Arn"
+    Value: !GetAtt IAMIdentityCenterInstance.InstanceArn
+    Export:
+      Name: "IDCInstanceArn"
+    
+  UserName: 
+    Description: "User name"
+    Value: !Ref UserName
+    Export:
+      Name: "UserName"
+        
+  Password:
+    Description: "User password"
+    Value: !Ref Password
+    Export:
+      Name: "Password"
+        
+  UserEmail: 
+    Description: "User email"
+    Value: !Ref UserEmail
+    Export:
+      Name: "UserEmail"
+    
+  BedrockEmbeddingModelId: 
+    Description: "Bedrock Embedding Model Id"
+    Value: !Ref BedrockEmbeddingModelId
+    Export:
+      Name: "BedrockEmbeddingModelId"
+    
+  BedrockTextModelId:
+    Description: "Bedrock Text Model Id"
+    Value: !Ref BedrockTextModelId
+    Export:
+      Name: "BedrockTextModelId"
+    
+  RAGASContainerRepo:
+    Description: "RAGAS Container Repo"
+    Value: !Ref RAGASContainerRepo
+    Export:
+      Name: "RAGASContainerRepo"
+    
