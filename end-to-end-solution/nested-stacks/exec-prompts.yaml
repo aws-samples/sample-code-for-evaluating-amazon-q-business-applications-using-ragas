@@ -1,0 +1,436 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Template to exec prompt processing the table, unsing Q and eval with RAGAS. results stored back to dynamoDB'
+Parameters:
+  RagasBucket:
+    Type: String
+    Description: S3 Bucket for RAGAS evaluation
+  
+  RagasKey:
+    Type: String
+    Description: S3 Key for RAGAS evaluation
+    Default: "ragas_lambda"
+
+Resources:
+
+  # DynamoDB to store prompts and results
+  BedrockBenchmarkPromptsTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: bedrockbenchmarkprompts
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  # DynamoDB to store prompts and results
+  bedrockbenchmarkpromptsResults:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: bedrockbenchmarkpromptsResults
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  #DynamoDB Stream SQS
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: "DynamoDBEventsQueue"
+      VisibilityTimeout: 5400
+      ReceiveMessageWaitTimeSeconds: 20
+
+
+  #S3 to load csv with prompt for eval
+  S3PromptSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub riv2024-qb-prompt-source-${AWS::AccountId}
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  # Lambda for DynamoDB Streams to SQS
+  DynamoDBToSQSFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "DynamoDBToSQSFunction"
+      Handler: "index.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: "python3.12"
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref SQSQueue
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          sqs = boto3.client('sqs')
+          queue_url = os.environ['SQS_QUEUE_URL']
+          
+          def lambda_handler(event, context):
+              for record in event['Records']:
+
+                  if record['eventName'] == 'INSERT':
+                    new_image = record['dynamodb']['NewImage']
+                    body = json.dumps(new_image)
+                    response = sqs.send_message(QueueUrl=queue_url, MessageBody=body)
+                    print(f"Message sent to SQS with ID: {response['MessageId']}")
+
+              return {'statusCode': 200, 'body': 'Messages processed'}
+
+  #Lambda to process new S3 prompt files and populate DynamoDB
+
+  PopulateTableLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'PopulateTableLambdaFunction'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: 'python3.12'
+      Timeout: 300
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref BedrockBenchmarkPromptsTable
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import os
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+
+                  if not key.lower().endswith('.csv'):
+                    print(f'Invalid file type: {key}')
+                    continue
+
+                  # Download the file from s3
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  data = obj['Body'].read().decode('utf-8')
+
+                  prompts = data.split('\n')
+                    
+                  id = 100
+
+                  for row in prompts:
+                      
+                      row_data = row.split("|")
+
+                      category = row_data[0]
+                      prompt = row_data[1]
+                      ground_truth = row_data[2]
+
+                      item = {
+                          "id": f"{category}_{id}",
+                          "prompt": prompt,
+                          "ground_truth": ground_truth
+                      }
+                      table.put_item(Item=item)
+                                
+                      id += 100
+
+  #IAM Role for Lambda funcs
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: 'LambdaDynamoDBPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DescribeTable
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:ListStreams
+                Resource: 
+                  - !Sub '${BedrockBenchmarkPromptsTable.Arn}'
+                  - !Sub '${BedrockBenchmarkPromptsTable.Arn}/stream/*'
+              
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt SQSQueue.Arn
+              
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${S3PromptSourceBucket.Arn}'
+                  - !Sub '${S3PromptSourceBucket.Arn}/*'
+
+
+  #DynamoDB Stream Event source Mapping
+  DynamoDBStreamToSQSMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: True
+      EventSourceArn: !GetAtt BedrockBenchmarkPromptsTable.StreamArn
+      FunctionName: !GetAtt DynamoDBToSQSFunction.Arn
+      StartingPosition: TRIM_HORIZON
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"eventName": ["INSERT"]}'
+  
+
+  #S3 Bucket Invoke permission
+  PopulateTableLambdaFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref PopulateTableLambdaFunction
+      Principal: 's3.amazonaws.com'
+      SourceArn: !GetAtt S3PromptSourceBucket.Arn
+    
+  # Custom Resource to add S3 event notification
+  S3EventNotificationCustomResource:
+    Type: Custom::S3EventNotification
+    DependsOn: PopulateTableLambdaFunctionInvokePermission
+    Properties:
+      ServiceToken: !GetAtt S3EventNotificationLambda.Arn
+      BucketName: !Ref S3PromptSourceBucket
+      LambdaArn: !GetAtt PopulateTableLambdaFunction.Arn
+
+  # Lambda function to add S3 event notification
+  S3EventNotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt S3EventNotificationLambdaRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      bucket = event['ResourceProperties']['BucketName']
+                      lambda_arn = event['ResourceProperties']['LambdaArn']
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={
+                              'LambdaFunctionConfigurations': [
+                                  {
+                                      'LambdaFunctionArn': lambda_arn,
+                                      'Events': ['s3:ObjectCreated:*']
+                                  }
+                              ]
+                          }
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+  
+  # IAM Role for S3EventNotificationLambda
+  S3EventNotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3EventNotificationLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                Resource: !GetAtt S3PromptSourceBucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*    
+
+  LambdaProcessExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'LambdaProcessExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: 'LambdaResultsDynamoDBPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !ImportValue UserCredentialsSecret
+              # ECR Permissions
+              - Effect: Allow
+                Action:
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'cognito-idp:AdminInitiateAuth'
+                  - 'cognito-idp:DescribeUserPool'
+                  - 'cognito-idp:InitiateAuth'
+                Resource: '*'
+             
+              - Effect: Allow
+                Action:
+                  - 'sso-oidc:CreateToken'
+                  - 'sso-oauth:CreateTokenWithIAM'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes  # Added permission for SQS GetQueueAttributes
+                Resource: !GetAtt SQSQueue.Arn
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource: '*'
+              # SageMaker permissions (for Bedrock integration)
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:InvokeEndpoint'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sts:AssumeRole'
+                  - 'sts:SetContext'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'events:PutEvents'
+                Resource: "*" 
+  
+  AssumableRoleForLambdaProcess:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'AssumableRoleForLambdaProcess'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaProcessExecutionRole.Arn
+            Action:
+              - 'sts:AssumeRole'
+              - 'sts:SetContext'
+      Path: '/'
+      Policies:
+        - PolicyName: 'AssumableRolePolicyProcess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'qbusiness:ChatSync'
+                    # Add any other actions needed
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DescribeTable'
+                  - 'dynamodb:BatchWriteItem'
+                Resource: '*'
+              
+    DependsOn:
+      - LambdaProcessExecutionRole
+
+  
+  ProcessTableLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'ProcessTableLambdaFunction'
+      PackageType: Image
+      Role: !GetAtt LambdaProcessExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 20  # This limits the number of concurrent executions
+      Code:
+        ImageUri: !Sub 
+          - '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RAGASContainerRepo}:latest'
+          - RAGASContainerRepo: !ImportValue RAGASContainerRepo
+      Environment:
+        Variables:
+          AwsRegion: !Sub '${AWS::Region}'
+          PromptEvalResultsTable: !Ref bedrockbenchmarkpromptsResults
+          IamRoleArn: !GetAtt AssumableRoleForLambdaProcess.Arn
+          TABLE_NAME: !Ref BedrockBenchmarkPromptsTable
+          UserCredentialsSecret: !ImportValue UserCredentialsSecret
+          BedrockEmbeddingModelId: !ImportValue BedrockEmbeddingModelId
+          BedrockTextModelId: !ImportValue BedrockTextModelId
+          UserPoolId: !ImportValue UserPool
+          ClientId: !ImportValue ClientId
+          IDC_APPLICATION_ID: !ImportValue IdcApplicationArn
+          AMAZON_Q_APP_ID: !ImportValue AmazonQAppId
+    
+  SQSToLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SQSQueue.Arn
+      FunctionName: !Ref ProcessTableLambdaFunction
+      BatchSize: 1  # Adjust this based on how many SQS messages you want processed at once
+    

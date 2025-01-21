@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Nested stack to create a new AppConfig version profile
+
+Resources:
+  UserCredentialsSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Description: 'Secret to store Cognito user credentials'
+      SecretString: 
+        !Join 
+          - ''
+          - - '{"username":"'
+            - !ImportValue "UserName"
+            - '","password":"'
+            - !ImportValue "Password"
+            - '"}'
+  
+  NewConfigVersion:
+    Type: AWS::AppConfig::HostedConfigurationVersion
+    Properties:
+      ApplicationId: !ImportValue "AppConfigID"
+      ConfigurationProfileId: !ImportValue "AppConfigConfigProfileID"
+      ContentType: "application/json"
+      Content: !Sub 
+        - |
+          {
+            "AmazonQAppId": "${AmazonQAppId}",
+            "IamRoleArn": "${IamRoleArn}",
+            "Region": "${AWS::Region}",
+            "IdcApplicationArn": "${IdcApplicationArn}",
+            "OAuthConfig": {
+              "ClientId": "${ClientId}",
+              "ExternalDns": "${ExternalDns}",
+              "CognitoDomain" : "${CognitoDomain}"
+            }
+          }
+        - AmazonQAppId: !ImportValue AmazonQAppId
+          IamRoleArn: !ImportValue IamRoleArn
+          IdcApplicationArn: !ImportValue IdcApplicationArn
+          ClientId: !ImportValue ClientId
+          ExternalDns: !ImportValue ExternalDns
+          CognitoDomain: !ImportValue CognitoDomain
+
+  AppConfigDeploymentStrategy:
+    Type: AWS::AppConfig::DeploymentStrategy
+    Properties:
+      DeploymentDurationInMinutes: 0
+      FinalBakeTimeInMinutes: 0
+      GrowthFactor: 100
+      Name: "Quick deployment"
+      ReplicateTo: "NONE"
+      GrowthType: "LINEAR"
+
+  AppConfigDeployment:
+    Type: AWS::AppConfig::Deployment
+    Properties:
+      ApplicationId: !ImportValue "AppConfigID"
+      EnvironmentId: !ImportValue "AppConfigEnvironmentID"
+      DeploymentStrategyId: !Ref AppConfigDeploymentStrategy
+      ConfigurationProfileId: !ImportValue "AppConfigConfigProfileID"
+      ConfigurationVersion: !Ref NewConfigVersion
+
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Admins
+      UserPoolId: !ImportValue "UserPool"
+
+  InitialUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !ImportValue "UserPool"
+      Username: !ImportValue "UserName"
+      MessageAction: "SUPPRESS"
+      UserAttributes: 
+        - Name: email
+          Value: !ImportValue "UserEmail"
+        - Name: email_verified
+          Value: "true"
+      
+
+  UserInGroup:
+    Type: AWS::Cognito::UserPoolUserToGroupAttachment
+    Properties:
+      GroupName: !Ref AdminGroup
+      Username: !ImportValue "UserName"
+      UserPoolId: !ImportValue "UserPool"    
+
+  LambdaPwdExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Ref UserCredentialsSecret       
+        - PolicyName: CognitoAdminSetUserPassword
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cognito-idp:AdminSetUserPassword'
+                Resource: !Sub 
+                  - 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}'
+                  - UserPoolId: !ImportValue UserPool
+
+  SetCognitoUserPasswordLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - InitialUser
+      - LambdaPwdExecutionRole
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaPwdExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          SECRET_NAME: !Ref UserCredentialsSecret
+          UserPoolId: !ImportValue "UserPool"
+      Code:
+        ZipFile: |
+          import boto3
+          from botocore.exceptions import ClientError
+          import cfnresponse
+          import os
+          import json
+
+          cognito_idp = boto3.client('cognito-idp')
+          
+          def SetUserPwd(user_pool_id, username, password):
+            try:
+              response = cognito_idp.admin_set_user_password(
+                UserPoolId=user_pool_id,
+                Username=username,
+                Password=password,
+                Permanent=True
+              )
+              print(f"Password successfully set for user: {username}")
+              return True
+            except ClientError as e:
+              print(f"Error setting password for user: {e}")
+              return False
+
+          def handler(event, context): 
+            
+            secret_name = os.environ['SECRET_NAME']
+            user_pool_id = os.environ['UserPoolId']
+            
+            # Get secret
+            secrets_manager = boto3.client('secretsmanager')
+            secret = secrets_manager.get_secret_value(SecretId=secret_name)
+            secret_dict = json.loads(secret['SecretString'])
+
+            username = secret_dict['username']
+            new_password = secret_dict['password']
+                        
+            if event['RequestType'] in ['Create', 'Update']:
+                            
+                success = SetUserPwd(user_pool_id,username,new_password)
+
+                
+                if success:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Password set successfully'})
+                else:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Message': 'Failed to set password'})
+
+            elif event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'No action on Delete'})
+  
+  SetCognitoUserPasswordCustomResource:
+    Type: Custom::SetCognitoUserPassword
+    Properties:
+      ServiceToken: !GetAtt SetCognitoUserPasswordLambda.Arn
+      UserPoolId: !ImportValue "UserPool"
+      SECRET_NAME: !Ref UserCredentialsSecret
+  
+Outputs:
+  NewVersionNumber:
+    Description: 'The version number of the new configuration'
+    Value: !GetAtt NewConfigVersion.VersionNumber
+    Export:
+      Name: "NewVersionNumber"
+
+  UserCredentialsSecret:
+    Description: 'Secret to store Cognito user credentials'
+    Value: !Ref UserCredentialsSecret
+    Export:
+      Name: "UserCredentialsSecret"

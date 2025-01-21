@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Root stack for Amazon Q Business Evals Solution
+Parameters:
+  AssetsBucketName:
+    Type: String
+    Description: Name of the existing S3 bucket for assets
+  RagasBucketName:
+    Type: String
+    Description: Name of the existing S3 bucket for RAGAS content
+  Vpccidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: Must be a valid CIDR block format.
+  PublicSubnetAcidr:
+    Type: String
+    Default: 10.0.0.0/24
+    Description: CIDR block for public subnet A
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: Must be a valid CIDR block format.
+  PublicSubnetBcidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for public subnet B
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: Must be a valid CIDR block format.
+  PrivateSubnetAcidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for private subnet A
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: Must be a valid CIDR block format.
+  PrivateSubnetBcidr:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR block for private subnet B
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: Must be a valid CIDR block format.
+  BedrockEmbeddingModelId:
+    Type: String
+    Description: Bedrock embedding model for evals
+    Default: amazon.titan-embed-text-v1
+  BedrockTextModelId:
+    Type: String
+    Description: Bedrock text model for evals
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+  UserName:
+    Type: String
+    Description: Name of the IAM Identity Center user to create
+    Default: qbusiness
+    MinLength: 4
+    ConstraintDescription: must be at least 4 character
+  Password:
+    Type: String
+    Description: Password for the new cognition user
+    Default: Riv2024!
+    NoEcho: true
+  UserEmail:
+    Type: String
+    Description: Email of the IAM Identity Center user
+    Default: qbusiness@example.com
+    AllowedPattern: ^[^@]+@[^@]+\.[^@]+$
+    ConstraintDescription: must be a valid email address
+Resources:
+  AssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: AssetsBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AllowCloudFormationAccess
+          Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+          Action:
+          - s3:GetObject
+          Resource:
+            Fn::Sub: arn:aws:s3:::${AssetsBucketName}/*
+  RagasBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: RagasBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AllowCloudFormationAccess
+          Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+          Action:
+          - s3:GetObject
+          Resource:
+            Fn::Sub: arn:aws:s3:::${RagasBucketName}/*
+  InfrastructureStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.us-west-2.amazonaws.com/deployment-897722663539-teste-us-west-2/451ad949fafb6789485af1a1c1bd0c9e.template
+      Parameters:
+        Vpccidr:
+          Ref: Vpccidr
+        PublicSubnetAcidr:
+          Ref: PublicSubnetAcidr
+        PublicSubnetBcidr:
+          Ref: PublicSubnetBcidr
+        PrivateSubnetAcidr:
+          Ref: PrivateSubnetAcidr
+        PrivateSubnetBcidr:
+          Ref: PrivateSubnetBcidr
+        RagasBucket:
+          Ref: RagasBucketName
+        AssetsBucket:
+          Ref: AssetsBucketName
+        BedrockEmbeddingModelId:
+          Ref: BedrockEmbeddingModelId
+        BedrockTextModelId:
+          Ref: BedrockTextModelId
+        UserName:
+          Ref: UserName
+        UserEmail:
+          Ref: UserEmail
+        Password:
+          Ref: Password
+  StreamlitStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.us-west-2.amazonaws.com/deployment-897722663539-teste-us-west-2/cda00b2b7ef3dcb50201ed6feeb2f65a.template
+      Parameters:
+        StreamlitAppS3Bucket:
+          Ref: AssetsBucketName
+    DependsOn: InfrastructureStack
+  IntegrationStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.us-west-2.amazonaws.com/deployment-897722663539-teste-us-west-2/decfc54bcc394c9f7fca8e6ef76be8c3.template
+    DependsOn: StreamlitStack
+  AppConfigStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.us-west-2.amazonaws.com/deployment-897722663539-teste-us-west-2/b71cb0998640cdccf3e495985820dd4e.template
+    DependsOn: IntegrationStack
+  ExecPromptsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.us-west-2.amazonaws.com/deployment-897722663539-teste-us-west-2/55583cffaaa13b96ebb7a032d107378d.template
+      Parameters:
+        RagasBucket:
+          Ref: RagasBucketName
+    DependsOn: AppConfigStack
+Outputs:
+  StreamlitUrl:
+    Description: URL for the Streamlit application
+    Value:
+      Fn::GetAtt:
+      - StreamlitStack
+      - Outputs.URL
+  UserName:
+    Description: Name of the user to login
+    Value:
+      Ref: UserName
+  Password:
+    Description: Password of the user to login
+    Value:
+      Ref: Password
+  UserEmail:
+    Description: Email of the user to login
+    Value:
+      Ref: UserEmail
+  AssetsBucketName:
+    Description: Name of the assets bucket
+    Value:
+      Ref: AssetsBucketName
+  RagasBucketName:
+    Description: Name of the RAGAS source bucket
+    Value:
+      Ref: RagasBucketName

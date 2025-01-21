@@ -1,0 +1,6 @@
+ragas==0.1.16
+pyJWT==2.9.0
+langchain-aws==0.1.17
+datasets
+nest-asyncio
+boto3
